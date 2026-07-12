@@ -1,0 +1,7 @@
+# ASK_POWERFULL_MODEL
+POWERFUL_MODEL_API_URL=http://localhost:20128/v1/chat/completions
+POWERFUL_MODEL_API_KEY=sk-c6912b1d8801a6e9-be28bd-81de19d2
+POWERFUL_MODEL_NAME=gweb/gemini-3.5-flash
+REPAIR_MODEL_API_URL=http://localhost:20128/v1/chat/completions
+REPAIR_MODEL_API_KEY=sk-c6912b1d8801a6e9-be28bd-81de19d2
+REPAIR_MODEL_NAME=cerebras/gemma-4-31b
