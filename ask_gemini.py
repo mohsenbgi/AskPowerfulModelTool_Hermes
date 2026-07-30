@@ -129,7 +129,7 @@ async def ask_gemini(query: str, model: str = "flash", task_id: str = None) -> s
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=sub_env
+            env=os.environ
         )
         stdout, stderr = await proc.communicate()
 
@@ -207,6 +207,106 @@ def _handle_ask_gemini(args, **kw):
         model=args.get("model", "flash"),
         task_id=task_id,
     )
+
+
+def _update_gemini_cookies(psid: str, psidts: str) -> str:
+    """Update GEMINI_COOKIES in the Hermes .env file and restart the daemon."""
+    hermes_home = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env_path = os.path.join(hermes_home, ".env")
+    if not os.path.exists(env_path):
+        return json.dumps({"error": f".env not found at {env_path}"})
+
+    psid = psid.strip()
+    psidts = psidts.strip()
+    if not psid or not psidts:
+        return json.dumps({"error": "Both __Secure-1PSID and __Secure-1PSIDTS are required"})
+
+    new_cookie = f"GEMINI_COOKIES=\"__Secure-1PSID={psid}; __Secure-1PSIDTS={psidts}\""
+
+    with open(env_path, "r") as f:
+        lines = f.readlines()
+
+    found = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("GEMINI_COOKIES="):
+            lines[i] = new_cookie + "\n"
+            found = True
+            break
+
+    if not found:
+        lines.append("# ASK_GEMINI\n")
+        lines.append(new_cookie + "\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+    # Shutdown the gemini daemon
+    import subprocess
+    shutdown_result = {"ok": False, "detail": "no daemon found"}
+    try:
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--shutdown"],
+            capture_output=True, text=True, timeout=10,
+        )
+        shutdown_result = {"ok": result.returncode == 0, "detail": result.stdout.strip() or result.stderr.strip()[:200]}
+    except Exception as e:
+        shutdown_result = {"ok": False, "detail": str(e)}
+
+    # Reload .env into os.environ so the new cookies take effect immediately
+    try:
+        from hermes_cli.config import reload_env
+        reload_env()
+    except Exception:
+        pass
+
+    return json.dumps({
+        "ok": True,
+        "message": f"GEMINI_COOKIES updated in {env_path}",
+        "shutdown": shutdown_result,
+        "cookies_set": f"__Secure-1PSID={psid[:20]}...; __Secure-1PSIDTS={psidts[:20]}..."
+    })
+
+
+UPDATE_GEMINI_COOKIES_SCHEMA = {
+    "name": "update_gemini_cookies",
+    "description": (
+        "Update the GEMINI_COOKIES environment variable in the Hermes .env file "
+        "with new __Secure-1PSID and __Secure-1PSIDTS cookie values. "
+        "Also kills any running gemini daemon processes so the new cookies take effect."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "secure_1psid": {
+                "type": "string",
+                "description": "The __Secure-1PSID cookie value"
+            },
+            "secure_1psidts": {
+                "type": "string",
+                "description": "The __Secure-1PSIDTS cookie value"
+            }
+        },
+        "required": ["secure_1psid", "secure_1psidts"]
+    }
+}
+
+
+def _handle_update_gemini_cookies(args, **kw):
+    return _update_gemini_cookies(
+        psid=args.get("secure_1psid", ""),
+        psidts=args.get("secure_1psidts", ""),
+    )
+
+
+registry.register(
+    name="update_gemini_cookies",
+    toolset="ask_gemini",
+    schema=UPDATE_GEMINI_COOKIES_SCHEMA,
+    handler=_handle_update_gemini_cookies,
+    check_fn=None,
+    requires_env=[],
+    is_async=False,
+)
 
 
 registry.register(
