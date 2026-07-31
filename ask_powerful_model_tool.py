@@ -1,16 +1,57 @@
 # tools/ask_powerful_model_tool.py
 """Ask Powerful Model Tool -- queries a free/powerful OpenAI-compatible
 model and automatically repairs duplicated/stuttered text before
-returning the result, so callers never see corrupted output."""
+returning the result, so callers never see corrupted output.
+
+This version keeps per-session message history in memory, keyed by the
+`task_id` that hermes's registry/agent loop injects into the tool
+handler via kwargs, so repeated calls within the same task continue the
+same chat with the upstream model instead of each call starting a
+brand-new one-shot conversation.
+
+IMPORTANT: api_url must be like https://example.com/v1/chat/completions
+"""
 
 import json
 import os
 import re
 import logging
+import time
+from typing import Dict, List
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# --- Conversation history store ---
+#
+# Keyed by conversation_id -> list of {"role": ..., "content": ...} dicts.
+# This is a simple in-memory store (per-process). If the process is
+# restarted, or the tool is running across multiple workers/instances,
+# history will not be shared. For durable/multi-worker persistence,
+# swap this dict out for a real store (Redis, DB, etc.) behind the same
+# get/append/reset interface.
+
+_MAX_HISTORY_MESSAGES = int(os.getenv("POWERFUL_MODEL_MAX_HISTORY_MESSAGES", "40"))
+_conversations: Dict[str, List[dict]] = {}
+
+
+def _get_history(conversation_id: str) -> List[dict]:
+    return _conversations.setdefault(conversation_id, [])
+
+
+def _append_and_trim(conversation_id: str, role: str, content: str) -> None:
+    history = _get_history(conversation_id)
+    history.append({"role": role, "content": content})
+    if len(history) > _MAX_HISTORY_MESSAGES:
+        # Keep the most recent messages; drop the oldest ones first.
+        del history[: len(history) - _MAX_HISTORY_MESSAGES]
+
+
+def reset_conversation(conversation_id: str) -> None:
+    """Clear stored history for a given conversation id."""
+    _conversations.pop(conversation_id, None)
 
 
 # --- Availability check ---
@@ -148,15 +189,31 @@ async def _llm_repair(broken_text: str) -> str:
 
 # --- Handler ---
 
-async def ask_powerful_model_tool(query: str) -> str:
+async def ask_powerful_model_tool(query: str, task_id: str = None) -> str:
     """Query the configured powerful/free model and return clean,
-    de-duplicated text. Returns a JSON string."""
+    de-duplicated text. Maintains message history per `task_id` (the
+    calling session/task, injected by the registry/agent loop via
+    kwargs -- not read from env and not supplied by the model) so
+    consecutive calls within the same session continue the same chat
+    instead of each call starting a brand-new conversation with the
+    upstream model. Returns a JSON string.
+    """
     model_url = os.getenv("POWERFUL_MODEL_API_URL")
     model_key = os.getenv("POWERFUL_MODEL_API_KEY")
     model_name = os.getenv("POWERFUL_MODEL_NAME", "default-model")
 
     if not model_url or not model_key:
         return json.dumps({"error": "POWERFUL_MODEL_API_URL / POWERFUL_MODEL_API_KEY not configured"})
+
+    # Fall back to a stable default if no task_id was supplied (e.g. tool
+    # invoked outside the normal agent loop / tests).
+    conversation_id = task_id or "default"
+
+    # Add the new user turn to this conversation's history, then send
+    # the *entire* history (not just the latest message) so the model
+    # has context from earlier turns in the same chat.
+    _append_and_trim(conversation_id, "user", query)
+    messages_to_send = list(_get_history(conversation_id))
 
     try:
         async with httpx.AsyncClient(timeout=180) as client:
@@ -165,7 +222,7 @@ async def ask_powerful_model_tool(query: str) -> str:
                 headers={"Authorization": f"Bearer {model_key}"},
                 json={
                     "model": model_name,
-                    "messages": [{"role": "user", "content": query}],
+                    "messages": messages_to_send,
                     "stream": False,
                 },
             )
@@ -192,6 +249,10 @@ async def ask_powerful_model_tool(query: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"Repair model call failed: {e}"})
 
+    # Store the assistant's (cleaned) reply so the next call in this
+    # conversation has it as context, continuing the same chat.
+    _append_and_trim(conversation_id, "assistant", cleaned)
+
     return json.dumps({"result": cleaned})
 
 
@@ -203,7 +264,9 @@ ASK_POWERFUL_MODEL_SCHEMA = {
         "Ask the configured powerful/free model a question or give it a "
         "task (search-style query, question to answer, content to "
         "analyze). Automatically repairs duplicated/stuttered text the "
-        "model's API is known to sometimes return."
+        "model's API is known to sometimes return. Conversation history "
+        "is kept automatically per session, so consecutive calls within "
+        "the same task continue the same chat with the model."
     ),
     "parameters": {
         "type": "object",
@@ -222,12 +285,25 @@ ASK_POWERFUL_MODEL_SCHEMA = {
 
 from tools.registry import registry
 
+
+def _handle_ask_powerful_model(args, **kw):
+    # task_id is injected by the registry/agent loop via kwargs, not read
+    # from an environment variable and not supplied by the model, so it's
+    # correct per-session even when multiple sessions/tasks run
+    # concurrently -- and it's what lets consecutive calls continue the
+    # same upstream chat instead of each one starting a new one.
+    task_id = kw.get("task_id")
+    return ask_powerful_model_tool(
+        query=args.get("query", ""),
+        task_id=task_id,
+    )
+
+
 registry.register(
     name="ask_powerful_model",
     toolset="ask_powerful_model",
     schema=ASK_POWERFUL_MODEL_SCHEMA,
-    handler=lambda args, **kw: ask_powerful_model_tool(
-        query=args.get("query", "")),
+    handler=_handle_ask_powerful_model,
     check_fn=check_ask_powerful_model_requirements,
     requires_env=[
         "POWERFUL_MODEL_API_URL", "POWERFUL_MODEL_API_KEY",
